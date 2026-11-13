@@ -1,0 +1,7 @@
+# Replace this with one exact existing local space name.
+@space Example workspace
+
+# Safe illustrative commands only; no real owner layout or model presets.
+"Example tab" 1 printf 'Example startup command\n'
+# Uncomment only after choosing a private Pi slot:
+# "Example assistant" 1 herdr-boot pi example-slot

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+node_modules/
+dist/
+build/
+.env
+.env.*
+!.env.example
+*.jsonl
+*.log
+/private/
+/state/
+herdr-app_on_boot_run.txt

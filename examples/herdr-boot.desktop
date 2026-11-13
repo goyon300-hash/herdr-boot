@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Herdr Desktop
+Comment=Open Herdr on graphical login
+Exec=herdr-app
+Terminal=false
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Populate Herdr tabs from a human-editable file. No third-party dependencies."""
+import argparse
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("HERDR_BOOT_CONFIG", HOME / "herdr-app_on_boot_run.txt")).expanduser()
+STATE = Path(os.environ.get("HERDR_BOOT_STATE",
+             Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "herdr-boot")).expanduser().resolve()
+ROW = re.compile(r'''^((?:"[^"]*"|'[^']*'|\S+))\s+([1-9][0-9]*)\s+(.+)$''')
+
+
+class BootError(Exception):
+    pass
+
+
+def run(args, timeout=25, input=None):
+    try:
+        p = subprocess.run(args, input=input, text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise BootError(f"{Path(args[0]).name} timed out; inspect the terminal before retrying") from None
+    if p.returncode:
+        # Do not echo a submitted command (it could contain a credential).
+        raise BootError(f"{Path(args[0]).name} {args[1] if len(args)>1 else ''} failed (exit {p.returncode})")
+    return p.stdout
+
+
+def effect(action, resource, description, path=None):
+    args = ["agent-change-log", "system", "--action", action,
+            "--resource", resource, "--description", description]
+    if path:
+        args += ["--path", str(path)]
+    run(args)
+
+
+def file_effect(path, existed, description):
+    run(["agent-change-log", "file", "modify" if existed else "create", str(path),
+         "--description", description])
+
+
+def ensure_dir(path):
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700)
+        effect("create", "herdr-boot directory", "Created private Herdr boot state directory.", directory)
+
+
+def parse_config(path):
+    space = None
+    rows = []
+    seen = set()
+    slots = set()
+    for line_no, line in enumerate(path.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("@space "):
+            if space is not None or rows:
+                raise BootError(f"line {line_no}: @space must occur once, before commands")
+            space = line[7:].strip().strip('"\'')
+            continue
+        match = ROW.fullmatch(line)
+        if not match:
+            raise BootError(f"line {line_no}: expected TAB PANE_NUMBER COMMAND")
+        tab, number, command = match.groups()
+        names = shlex.split(tab)
+        if not names or not names[0]:
+            raise BootError(f"line {line_no}: tab name cannot be empty")
+        tab = names[0]
+        number = int(number)
+        if number > 32:
+            raise BootError(f"line {line_no}: pane limit is 32")
+        if (tab, number) in seen:
+            raise BootError(f"line {line_no}: duplicate tab/pane")
+        seen.add((tab, number))
+        # A Pi slot must belong to only one pane.
+        parts = shlex.split(command)
+        if len(parts) >= 3 and Path(parts[0]).name == "herdr-boot" and parts[1] == "pi":
+            if parts[2] in slots:
+                raise BootError(f"line {line_no}: duplicate Pi slot")
+            slots.add(parts[2])
+        rows.append((tab, number, command))
+    if not space:
+        raise BootError("Add @space FOLDER (or an exact local space name) before commands")
+    return space, rows
+
+
+def core_layout():
+    request = {"jsonrpc": "2.0", "id": 1, "method": "doc.get", "params": {"name": "herdr-app"}}
+    output = run(["hc", "connect"], input=json.dumps(request) + "\n")
+    for line in output.splitlines():
+        reply = json.loads(line)
+        if reply.get("id") == 1 and "result" in reply:
+            return reply["result"].get("value") or {"spaces": []}
+    raise BootError("Cannot read Herdr's saved layout through hc")
+
+
+def ordered_panes(root):
+    """Geometric left-to-right; equal left edge uses top-to-bottom. Mods omitted."""
+    result = []
+
+    def walk(node, x=0.0, y=0.0, w=1.0, h=1.0):
+        terminal = node.get("content", {}).get("terminal")
+        if terminal:
+            result.append((round(x, 9), round(y, 9), node["id"], terminal))
+        children = node.get("children", [])
+        if not children:
+            return
+        if node.get("type") not in ("row", "column"):
+            raise BootError("Unsupported pane layout; expected row/column splits")
+        if any("px" in c.get("size", {}) for c in children):
+            raise BootError("Pixel-sized tab splits cannot be numbered reliably")
+        weights = [float(c.get("size", {}).get("weight", 1)) for c in children]
+        if any(not math.isfinite(v) or v <= 0 for v in weights):
+            raise BootError("Invalid split weight")
+        total = sum(weights)
+        if not math.isfinite(total):
+            raise BootError("Invalid total split weight")
+        offset = 0.0
+        for child, weight in zip(children, weights):
+            fraction = weight / total
+            if node.get("type") == "row":
+                walk(child, x + w * offset, y, w * fraction, h)
+            else:
+                walk(child, x, y + h * offset, w, h * fraction)
+            offset += fraction
+
+    walk(root)
+    return [(pane, terminal) for _, _, pane, terminal in sorted(result)]
+
+
+def select_space(layout, selector):
+    matches = [s for s in layout.get("spaces", [])
+               if s.get("folder") == selector or s.get("name") == selector]
+    if len(matches) != 1:
+        raise BootError(f"Space {selector!r}: expected exactly one local match; found {len(matches)}")
+    if matches[0].get("machine"):
+        raise BootError("Remote spaces are not supported")
+    return matches[0]
+
+
+def find_tab(space, name):
+    matches = [t for t in space.get("tabs", []) if t.get("name") == name]
+    if len(matches) > 1:
+        raise BootError(f"Ambiguous tab name: {name!r}")
+    return matches[0] if matches else None
+
+
+def idle_shell(terminal):
+    fg = terminal.get("foreground") or {}
+    if terminal.get("state") != "live" or fg.get("name") != "bash":
+        return False
+    pid = terminal.get("pid")
+    if fg.get("pid") != pid or terminal.get("status") is not None:
+        return False
+    # Do not send into bash -c scripts, or a shell with background jobs.
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if any(a == b"-c" or (a.startswith(b"-") and not a.startswith(b"--") and b"c" in a[1:]) for a in argv[1:] if a):
+            return False
+        children = Path(f"/proc/{pid}/task/{pid}/children").read_text().strip()
+        return not children
+    except OSError:
+        return False
+
+
+def shell_token(terminal):
+    pid = terminal["pid"]
+    # PID alone can be reused, and hc terminal addresses survive reboot.
+    stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    return f"{boot}:{pid}:{stat[19]}"
+
+
+def app_do(command, args):
+    reply = json.loads(run(["herdr-app", "do", command, json.dumps(args)]))
+    if "error" in reply:
+        raise BootError(f"Herdr rejected {command}")
+    effect("modify", "Herdr tab layout", f"Applied {command} to populate configured boot panes.")
+    return reply
+
+
+def populate(config, apply=False):
+    selector, rows = parse_config(config)
+    layout = core_layout()
+    space = select_space(layout, selector)
+    # Preflight ambiguity/layout validation before making any changes.
+    for name in dict.fromkeys(row[0] for row in rows):
+        tab = find_tab(space, name)
+        if tab:
+            ordered_panes(tab["root"])
+    if not apply:
+        for name, number, command in rows:
+            tab = find_tab(space, name)
+            panes = ordered_panes(tab["root"]) if tab else []
+            target = panes[number - 1][1] if len(panes) >= number else "(create)"
+            print(f"{name:16} {number:2} {target:10} {command}")
+        return
+    # Require a live app before making layout changes or starting programs.
+    run(["herdr-app", "status"])
+    if not shutil.which("agent-change-log"):
+        raise BootError("agent-change-log is required before making changes")
+    ensure_dir(STATE)
+    ledger_path = STATE / "started.json"
+    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+    before = json.loads(run(["herdr-app", "status"]))
+    try:
+        for name, number, command in rows:
+            space = select_space(core_layout(), selector)
+            tab = find_tab(space, name)
+            if not tab:
+                app_do("tab.new", {"space": space["id"], "name": name, "folder": space["folder"]})
+                tab = find_tab(select_space(core_layout(), selector), name)
+                if tab is None:
+                    raise BootError("New tab not yet available; retry later")
+            panes = ordered_panes(tab["root"])
+            while len(panes) < number:
+                if not panes:
+                    raise BootError(f"Tab {name!r} has no terminal pane to split")
+                app_do("pane.split", {"pane": panes[-1][0], "direction": "right"})
+                updated = find_tab(select_space(core_layout(), selector), name)
+                next_panes = ordered_panes(updated["root"])
+                if len(next_panes) <= len(panes):
+                    raise BootError("New split not yet available; retry later")
+                panes = next_panes
+            pane, address = panes[number - 1]
+            terminal = json.loads(run(["hc", "get", address]))
+            if not idle_shell(terminal):
+                print(f"SKIP {name} {number} ({address}): program running or shell not safely idle")
+                continue
+            token = shell_token(terminal)
+            digest = hashlib.sha256(command.encode()).hexdigest()
+            key = f"{address}:{digest}"
+            if ledger.get(key) == token:
+                print(f"SKIP {name} {number} ({address}): already submitted/reserved in this shell")
+                continue
+            if not terminal.get("keep"):
+                run(["hc", "keep", address])
+                verified = json.loads(run(["hc", "get", address]))
+                if not verified.get("keep"):
+                    raise BootError(f"Could not enable keep on {address}")
+                effect("modify", f"herdr-core terminal {address}", "Enabled shell recovery after terminal loss.")
+            # Reserve before delivery. If hc times out after accepting a command, an
+            # automatic retry must not submit it again, even if it finished quickly.
+            ledger[key] = token
+            existed = ledger_path.exists()
+            tmp = STATE / ".started.tmp"
+            tmp.write_text(json.dumps(ledger, indent=2) + "\n")
+            tmp.replace(ledger_path)
+            file_effect(ledger_path, existed, "Reserved per-shell boot command delivery to prevent duplicate attempts.")
+            # Never interrupt or force delivery. hc honors unsent drafts. The subshell
+            # sources .bashrc (functions/aliases) and leaves the kept parent shell alive.
+            run(["hc", "send", address, "bash -ic " + shlex.quote(command)], timeout=90)
+            effect("start", f"herdr-core terminal {address}", "Submitted configured boot command to an idle shell.")
+            print(f"START {name} {number} ({address})")
+    finally:
+        # Restore the user's focus if creation moved it. No killing/rearranging.
+        current = json.loads(run(["herdr-app", "status"]))
+        if current.get("focused_pane") != before.get("focused_pane") and before.get("focused_pane"):
+            app_do("pane.focus", {"pane": before["focused_pane"]})
+
+
+def slot_dir(slot):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", slot):
+        raise BootError("Pi slot: use 1-64 letters, digits, underscore, dot or dash")
+    return STATE / "pi" / slot
+
+
+def session_header(path):
+    with path.open() as handle:
+        header = json.loads(handle.readline())
+    if header.get("type") != "session" or not Path(header.get("cwd", "")).is_absolute():
+        raise BootError("Not a Pi session file with an absolute working directory")
+    return header
+
+
+def bind_pi(slot, source):
+    source = Path(source).expanduser().resolve(strict=True)
+    session_header(source)
+    directory = slot_dir(slot)
+    if directory.exists() and any(directory.glob("*.jsonl")):
+        raise BootError("Slot already has sessions; use another slot name (never overwrite a conversation)")
+    ensure_dir(directory)
+    link = directory / source.name
+    link.symlink_to(source)
+    file_effect(link, False, "Linked an existing Pi session into a dedicated Herdr pane slot.")
+    print(f"Bound Pi slot {slot}. Original session stays in place; future writes are shared.")
+
+
+def launch_pi(slot, extra):
+    directory = slot_dir(slot)
+    ensure_dir(directory)
+    lock_path = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"herdr-pi-{os.getuid()}-{slot}.lock"
+    lock = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise BootError(f"Pi slot {slot} is already running")
+    os.set_inheritable(lock, True)
+    sessions = sorted(directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime_ns)
+    args = ["pi", "--session-dir", str(directory)]
+    if sessions:
+        latest = sessions[-1]
+        cwd = Path(session_header(latest)["cwd"])
+        if not cwd.is_dir():
+            raise BootError("Pi session's working directory no longer exists")
+        os.chdir(cwd)
+        args += ["--session", str(latest)]
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    if any(arg.split("=", 1)[0] in {"--session", "--session-id", "--session-dir", "--continue", "-c", "--resume", "-r", "--fork", "--no-session", "--print", "-p", "--mode"} for arg in extra):
+        raise BootError("Pi slot manages session selection; pass only model/resource options")
+    effect("start", f"Herdr Pi slot {slot}", "Starting interactive Pi with a dedicated resumable session directory.")
+    os.execvp("pi", args + extra)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, default=CONFIG)
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("plan", help="validate and show tab/pane mapping without changes")
+    sub.add_parser("apply", help="create missing panes and launch commands in idle Bash shells")
+    sub.add_parser("list", help="list numbered local terminal panes")
+    pi = sub.add_parser("pi", help="start/resume the last conversation of a dedicated pane slot")
+    pi.add_argument("slot")
+    pi.add_argument("args", nargs=argparse.REMAINDER)
+    bind = sub.add_parser("bind-pi", help="seed an unused slot with an existing Pi session")
+    bind.add_argument("slot")
+    bind.add_argument("session", type=Path)
+    args = parser.parse_args()
+    if args.action not in {"plan", "list"} and not shutil.which("agent-change-log"):
+        raise BootError("agent-change-log is required before making changes")
+    if args.action == "pi":
+        launch_pi(args.slot, args.args)
+        return
+    if args.action == "bind-pi":
+        bind_pi(args.slot, args.session)
+        return
+    if args.action == "list":
+        for space in core_layout().get("spaces", []):
+            print(f"Space: {space.get('name') or space.get('folder')}")
+            for tab in space.get("tabs", []):
+                for i, (pane, terminal) in enumerate(ordered_panes(tab["root"]), 1):
+                    print(f"  {tab.get('name') or tab['id']:16} {i:2} {terminal:8} {pane}")
+        return
+    if args.action == "plan":
+        populate(args.config)
+        return
+    ensure_dir(STATE)
+    lock_path = STATE / "apply.lock"
+    existed = lock_path.exists()
+    with lock_path.open("a") as lock:
+        if not existed:
+            file_effect(lock_path, False, "Created Herdr boot application lock file.")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise BootError("Another boot launcher is applying the configuration")
+        populate(args.config, apply=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BootError, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        print(f"herdr-boot: {error}", file=sys.stderr)
+        sys.exit(1)
