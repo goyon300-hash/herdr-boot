@@ -50,7 +50,54 @@ Slots live under private state, `pi/SLOT/`. The newest modified JSONL file in th
 
 `bind-pi` validates the session header and creates a **symlink**, not a copy. Future writes are shared. An occupied slot is refused. Keep the original file. A helper-held flock prevents concurrent helper launches for one slot; it cannot detect Pi independently opening the same file. Do not concurrently bind/launch a slot or open its original elsewhere. Neither the slot lock nor recovery resumes an interrupted process in RAM.
 
-CLI/session behavior was reviewed against installed Pi 1.5.2 `docs/cli.md` and `docs/sessions.md`. No SDK/extension API is used. Check your installed Pi help when upgrading.
+Slot CLI/session behavior was reviewed against Pi 1.5.2. Check your installed Pi help when upgrading.
+
+## Opt-in Pi extension: `/revive`
+
+Install the updated helper above, then the extension:
+
+```sh
+install -Dm644 pi/revive.ts "$HOME/.pi/agent/extensions/revive.ts"
+```
+
+Run `/reload` in an existing Pi, or start Pi normally. `/revive` is an ON/OFF
+toggle for the current saved conversation. **New sessions and forks default OFF.**
+The footer displays `[REV: on]` or `[REV: off]`; status key `revive` appears
+immediately left of `mode` in a footer using descending status-key order.
+The extension uses Pi 1.5.2 APIs and has no extra dependencies or background watcher.
+
+It calls these commands without a shell:
+
+```sh
+herdr-boot set t12 /absolute/working/directory 'pi --session /absolute/session.jsonl'
+herdr-boot remove t12
+```
+
+`set` resolves a **local core terminal ID** to its named tab and numbered pane
+in the TXT file's configured `@space`. It adds or replaces that row with
+`cd -- <quoted cwd> && <command>`. `remove` deletes that row. Other rows and
+comments are preserved; neither command launches a program. Updates are locked,
+validated and atomically replaced. The command argument is trusted Bash code,
+not a sandbox. `--config PATH` (before the subcommand) or `HERDR_BOOT_CONFIG`
+selects a different restoration TXT; it must already contain an `@space`.
+
+The extension records the **absolute session file**, not `--continue` or a
+latest-session guess. Custom session directories work because the file path is
+explicit. A new conversation needs its first message saved before ON is allowed.
+The helper is selected by `HERDR_BOOT_BIN`, then `~/.local/bin/herdr-boot`, then
+PATH. A failed helper call leaves the toggle unchanged and reports an error.
+
+Only an explicit `/revive` changes the TXT. Starting a new session, quitting Pi,
+or closing a terminal does not remove an older entry. Toggle state is remembered
+in the Pi session for reload/resume in the same terminal; it is not a live monitor
+of manual TXT edits.
+
+**Pane movement/closure:** rows use tab names and pane numbers, not stable pane
+identities. Toggle OFF **before** moving, renaming or closing a pane/tab; after a
+move, toggle ON again in its new position. Otherwise the old row remains, and
+OFF at the new location targets the new position. A closed pane with a saved row
+can be recreated on the next `apply`. If already closed, edit the stale TXT row
+manually. No automatic registration or per-pane registry is included.
 
 ## Optional desktop-login deployment
 
@@ -74,6 +121,7 @@ The retired `herdr-run-onboot` launcher is intentionally omitted. No live legacy
 
 ```sh
 python3 -B -m unittest discover -s tests -v
+node --test tests/test_revive_extension.mjs
 ```
 
-Tests import the repository executable, use temporary synthetic sessions, mocked CLIs and one isolated Bash process. They never send to live terminals, launch Pi, or contact a model. Tests cover parsing, numbering, invalid weights, remote refusal, busy panes, binding, launch arguments, focus restoration and retry reservations. A real reboot/login and live application are not tested.
+Tests import the repository executable, use temporary synthetic sessions, mocked CLIs and one isolated Bash process. They never send to live terminals, launch Pi, or contact a model. Tests cover parsing, numbering, invalid weights, remote refusal, busy panes, binding, launch arguments, focus restoration, retry reservations, TXT set/remove and extension toggle lifecycle. A real reboot/login and live application are not tested.

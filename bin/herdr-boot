@@ -12,6 +12,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 
 HOME = Path.home()
 CONFIG = Path(os.environ.get("HERDR_BOOT_CONFIG", HOME / "herdr-app_on_boot_run.txt")).expanduser()
@@ -151,6 +152,83 @@ def select_space(layout, selector):
     if matches[0].get("machine"):
         raise BootError("Remote spaces are not supported")
     return matches[0]
+
+
+def edit_config_entry(config, terminal, cwd=None, command=None):
+    """Set/remove one existing terminal's TAB/PANE row; never launch anything."""
+    if not re.fullmatch(r"t[0-9a-z]+", terminal):
+        raise BootError("Use a local core terminal ID, such as t12")
+    if command is not None:
+        if not command.strip() or any(c in command for c in "\r\n\0"):
+            raise BootError("Command must be a nonempty single line")
+        cwd = Path(cwd).expanduser()
+        if not cwd.is_absolute() or not cwd.is_dir():
+            raise BootError("Working directory must be an existing absolute directory")
+    config = config.expanduser().resolve(strict=True)
+    lock_path = config.with_name(config.name + ".lock")
+    existed = lock_path.exists()
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        if not existed:
+            file_effect(lock_path, False, "Created lock for Herdr restoration TXT edits.")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        selector, _ = parse_config(config)
+        space = select_space(core_layout(), selector)
+        matches = []
+        for tab in space.get("tabs", []):
+            for number, (_, address) in enumerate(ordered_panes(tab["root"]), 1):
+                if address == terminal:
+                    matches.append((tab.get("name"), number))
+        if len(matches) != 1:
+            raise BootError("Terminal must belong to exactly one pane in the configured @space")
+        name, number = matches[0]
+        if not name or number > 32 or any(ord(c) < 32 for c in name):
+            raise BootError("Use a named tab and a pane numbered 1 through 32")
+        find_tab(space, name)  # Refuse duplicate tab names rather than edit the wrong row.
+        if "'" not in name:
+            token = shlex.quote(name)
+        elif '"' not in name:
+            token = '"' + name.replace("\\", "\\\\") + '"'
+        else:
+            raise BootError("Tab names containing both quote styles are not supported")
+        with config.open(newline="") as handle:
+            original = handle.read()
+        lines = original.splitlines(keepends=True)
+        index = None
+        for i, line in enumerate(lines):
+            match = ROW.fullmatch(line.strip())
+            if match and shlex.split(match[1])[0] == name and int(match[2]) == number:
+                index = i
+                break
+        if command is None:
+            if index is not None:
+                del lines[index]
+        else:
+            newline = "\r\n" if "\r\n" in original else "\n"
+            row = f"{token}  {number}  cd -- {shlex.quote(str(cwd))} && {command.strip()}{newline}"
+            if index is None:
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += newline
+                lines.append(row)
+            else:
+                lines[index] = row
+        updated = "".join(lines)
+        if updated != original:
+            tmp_fd, tmp_name = tempfile.mkstemp(prefix="." + config.name + ".", dir=config.parent)
+            try:
+                with os.fdopen(tmp_fd, "w", newline="") as handle:
+                    os.fchmod(handle.fileno(), config.stat().st_mode & 0o777)
+                    handle.write(updated)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                parse_config(Path(tmp_name))
+                os.replace(tmp_name, config)
+                file_effect(config, True, "Updated one terminal entry in the Herdr restoration TXT.")
+            finally:
+                Path(tmp_name).unlink(missing_ok=True)
+        return {"changed": updated != original, "tab": name, "pane": number}
+    finally:
+        os.close(fd)
 
 
 def find_tab(space, name):
@@ -335,6 +413,11 @@ def main():
     sub.add_parser("plan", help="validate and show tab/pane mapping without changes")
     sub.add_parser("apply", help="create missing panes and launch commands in idle Bash shells")
     sub.add_parser("list", help="list numbered local terminal panes")
+    set_entry = sub.add_parser("set", help="set one terminal's command in the restoration TXT")
+    set_entry.add_argument("terminal")
+    set_entry.add_argument("cwd")
+    set_entry.add_argument("command", help="one quoted shell command")
+    sub.add_parser("remove", help="remove one terminal's restoration TXT row").add_argument("terminal")
     pi = sub.add_parser("pi", help="start/resume the last conversation of a dedicated pane slot")
     pi.add_argument("slot")
     pi.add_argument("args", nargs=argparse.REMAINDER)
@@ -344,6 +427,11 @@ def main():
     args = parser.parse_args()
     if args.action not in {"plan", "list"} and not shutil.which("agent-change-log"):
         raise BootError("agent-change-log is required before making changes")
+    if args.action in {"set", "remove"}:
+        print(json.dumps(edit_config_entry(args.config, args.terminal,
+                         args.cwd if args.action == "set" else None,
+                         args.command if args.action == "set" else None)))
+        return
     if args.action == "pi":
         launch_pi(args.slot, args.args)
         return

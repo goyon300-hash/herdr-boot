@@ -1,6 +1,13 @@
 # Change log and feature inventory
 
-## Unreleased — public-source preparation
+## Unreleased — explicit Pi restoration toggle
+
+- Added `herdr-boot set TERMINAL CWD COMMAND` and `remove TERMINAL` for locked, atomic edits to the existing restoration TXT; no program execution or automatic registration.
+- Added optional `pi/revive.ts`: `/revive` toggles the current exact saved session, new sessions/forks start OFF, and `[REV: on/off]` is exposed through Pi's footer status API.
+- Added focused TXT and extension lifecycle tests; documented positional-pane limitations and the requirement to disable before moving or closing a pane.
+- Published the conservative live launcher as the base. Separate unfinished automatic-registry experiments are not included; existing boot/apply behavior is unchanged.
+
+## Previous — public-source preparation
 
 - Collected the owner's local Python launcher and offline regression tests; retained command/config/state compatibility and existing audit calls.
 - Configurable config/state paths; normalize state paths before Pi changes working directory.
