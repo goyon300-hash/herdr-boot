@@ -1,6 +1,14 @@
 # Change log and feature inventory
 
-## Unreleased — explicit Pi restoration toggle
+## Unreleased — automatic TXT restoration for Pi 1.5.2
+
+- Added `revive.ts`: new interactive Herdr sessions default ON and register their exact saved JSONL; session replacement updates the panel entry and clears stale unsaved-session entries.
+- Kept `/revive` as a per-session toggle; OFF removes immediately and survives resume, including in another panel.
+- Added a five-second external systemd user timer on quit. Removal requires running/degraded systemd, logind not preparing shutdown, and matching Pi-run ownership; unknown states preserve entries.
+- Added locked owner markers and row fingerprints to `herdr-boot set/remove`, including safe removal after a pane disappears and protection against stale timers.
+- Documented configuration and added focused extension/helper tests. Live Ctrl+D and the Herdr x-button command removed entries; an actual reboot remains for the owner to verify.
+
+## Previous — explicit Pi restoration toggle
 
 - Added `herdr-boot set TERMINAL CWD COMMAND` and `remove TERMINAL` for locked, atomic edits to the existing restoration TXT; no program execution or automatic registration.
 - Added optional `pi/revive.ts`: `/revive` toggles the current exact saved session, new sessions/forks start OFF, and `[REV: on/off]` is exposed through Pi's footer status API.

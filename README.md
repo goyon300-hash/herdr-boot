@@ -52,52 +52,49 @@ Slots live under private state, `pi/SLOT/`. The newest modified JSONL file in th
 
 Slot CLI/session behavior was reviewed against Pi 1.5.2. Check your installed Pi help when upgrading.
 
-## Opt-in Pi extension: `/revive`
+## Pi restoration and manual toggle (Pi 1.5.2)
 
-Install the updated helper above, then the extension:
-
-```sh
-install -Dm644 pi/revive.ts "$HOME/.pi/agent/extensions/revive.ts"
-```
-
-Run `/reload` in an existing Pi, or start Pi normally. `/revive` is an ON/OFF
-toggle for the current saved conversation. **New sessions and forks default OFF.**
-The footer displays `[REV: on]` or `[REV: off]`; status key `revive` appears
-immediately left of `mode` in a footer using descending status-key order.
-The extension uses Pi 1.5.2 APIs and has no extra dependencies or background watcher.
-
-It calls these commands without a shell:
+Install `pi/revive.ts` into `~/.pi/agent/extensions/revive.ts` and the matching
+`bin/herdr-boot`, then `/reload` in each running Pi. New interactive sessions
+start ON; `/revive` toggles the current conversation in the restoration TXT:
 
 ```sh
 herdr-boot set t12 /absolute/working/directory 'pi --session /absolute/session.jsonl'
 herdr-boot remove t12
 ```
 
-`set` resolves a **local core terminal ID** to its named tab and numbered pane
-in the TXT file's configured `@space`. It adds or replaces that row with
-`cd -- <quoted cwd> && <command>`. `remove` deletes that row. Other rows and
-comments are preserved; neither command launches a program. Updates are locked,
-validated and atomically replaced. The command argument is trusted Bash code,
-not a sandbox. `--config PATH` (before the subcommand) or `HERDR_BOOT_CONFIG`
-selects a different restoration TXT; it must already contain an `@space`.
+`set` resolves the local core terminal ID to its named tab and numbered pane in
+that file's `@space`, replacing or appending only that row. `remove` deletes it.
+Other rows/comments are preserved; neither command launches anything.
+`HERDR_BOOT_CONFIG` or global `--config PATH` selects another TXT file.
 
-The extension records the **absolute session file**, not `--continue` or a
-latest-session guess. Custom session directories work because the file path is
-explicit. A new conversation needs its first message saved before ON is allowed.
-The helper is selected by `HERDR_BOOT_BIN`, then `~/.local/bin/herdr-boot`, then
-PATH. A failed helper call leaves the toggle unchanged and reports an error.
+`revive.ts` defaults to `~/herdr-on-boot.txt`; override with `HERDR_BOOT_CONFIG`.
+The local installation aliases that filename to the existing
+`~/herdr-app_on_boot_run.txt`, so the login service reads the same contents.
+For another installation, create that symlink or point both the extension and
+login launcher at the same TXT. See `config.example.txt` for environment settings.
 
-Only an explicit `/revive` changes the TXT. Starting a new session, quitting Pi,
-or closing a terminal does not remove an older entry. Toggle state is remembered
-in the Pi session for reload/resume in the same terminal; it is not a live monitor
-of manual TXT edits.
+The footer shows `[REV: off]` or `[REV: on]` to the left of the mode indicator.
+Saved OFF follows the session across reload/resume, even in another terminal;
+a new session or fork defaults ON. `/new`, `/resume`, `/fork` and `/reload`
+replace the panel's entry with its current saved JSONL. An unsaved replacement
+clears the stale entry and registers within 250 ms after its file appears.
+Interactive subagents with their own app panes behave identically when they
+load this extension. Non-TUI, non-Herdr and `--no-session` runs do not register.
 
-**Pane movement/closure:** rows use tab names and pane numbers, not stable pane
-identities. Toggle OFF **before** moving, renaming or closing a pane/tab; after a
-move, toggle ON again in its new position. Otherwise the old row remains, and
-OFF at the new location targets the new position. A closed pane with a saved row
-can be recreated on the next `apply`. If already closed, edit the stale TXT row
-manually. No automatic registration or per-pane registry is included.
+On `session_shutdown` reason `quit` (including Ctrl+D, SIGHUP and SIGTERM), Pi
+schedules a one-shot **systemd user timer** for five seconds. The external service
+removes the row only if systemd reports `running` or `degraded`, logind reports
+`PreparingForShutdown=false`, and the row's owner token still matches. All other
+or unknown states preserve it. The owner marker and row fingerprint are checked
+under the TXT lock; an old timer cannot delete a newer Pi's row, even for the same
+session path. Removal also works after the pane/tab has disappeared. Explicit OFF
+removes immediately and persists in the session. Timer scheduling failures retain
+the row. A reboot starting within five seconds of a manual close may restore it.
+This requires `systemd-run`, `systemctl` and `busctl`; no permanent service is added.
+
+This extension edits TXT entries. Do not combine it with an independent
+restoration policy for the same panes.
 
 ## Optional desktop-login deployment
 

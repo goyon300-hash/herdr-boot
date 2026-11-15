@@ -127,6 +127,42 @@ class TxtToggleTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), self.saved)
         self.assertEqual(list(self.root.glob(".restore.txt.*")), [])
 
+    def test_owned_remove_after_pane_disappears(self):
+        owner = "11111111-1111-1111-1111-111111111111"
+        with patch.dict(os.environ, HERDR_BOOT_OWNER=owner):
+            self.change()
+            self.core.side_effect = AssertionError("closed pane must not need layout")
+            self.assertTrue(boot.edit_config_entry(self.config, "t12")["changed"])
+        self.assertEqual(self.config.read_bytes(), self.saved)
+
+    def test_old_timer_cannot_remove_new_run_even_for_same_session(self):
+        old = "11111111-1111-1111-1111-111111111111"
+        new = "22222222-2222-2222-2222-222222222222"
+        with patch.dict(os.environ, HERDR_BOOT_OWNER=old):
+            self.change()
+        with patch.dict(os.environ, HERDR_BOOT_OWNER=new):
+            self.change()
+        current = self.config.read_bytes()
+        with patch.dict(os.environ, HERDR_BOOT_OWNER=old):
+            self.assertFalse(boot.edit_config_entry(self.config, "t12")["changed"])
+        self.assertEqual(self.config.read_bytes(), current)
+        with patch.dict(os.environ, HERDR_BOOT_OWNER=new):
+            self.assertTrue(boot.edit_config_entry(self.config, "t12")["changed"])
+
+    def test_timer_preserves_manually_replaced_row(self):
+        with patch.dict(os.environ, HERDR_BOOT_OWNER="11111111-1111-1111-1111-111111111111"):
+            self.change()
+            self.config.write_text(self.config.read_text().replace("pi --session", "echo --session"))
+            current = self.config.read_bytes()
+            self.assertFalse(boot.edit_config_entry(self.config, "t12")["changed"])
+            self.assertEqual(self.config.read_bytes(), current)
+
+    def test_explicit_off_removes_owned_row_without_owner(self):
+        with patch.dict(os.environ, HERDR_BOOT_OWNER="11111111-1111-1111-1111-111111111111"):
+            self.change()
+        boot.edit_config_entry(self.config, "t12")
+        self.assertEqual(self.config.read_bytes(), self.saved)
+
     def test_cli_uses_env_config_and_never_launches_command(self):
         fakebin = self.root / "bin"
         fakebin.mkdir()

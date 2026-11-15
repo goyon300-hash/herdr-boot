@@ -1,0 +1,49 @@
+# Configuration reference; this file is a template, not parsed automatically.
+# Export environment settings before launching Pi/herdr-boot. In a user service,
+# put them in Environment= lines. Existing Pi processes need /reload for revive.ts.
+# No secrets are needed. Do not put credentials in startup commands.
+# Relative environment paths resolve against the launching process's cwd;
+# prefer absolute paths. ~/ is expanded in CONFIG and STATE (and revive CONFIG).
+# Relative helper executable paths resolve against Pi's cwd; bare names use PATH.
+
+# HERDR_BOOT_CONFIG — optional restoration TXT input/output path.
+# herdr-boot default: ~/herdr-app_on_boot_run.txt
+# revive.ts default: ~/herdr-on-boot.txt
+# Set the same absolute path for both, or symlink the latter to the former.
+# Example: export HERDR_BOOT_CONFIG=/home/USER/herdr-on-boot.txt
+# Global CLI override for herdr-boot only: --config /absolute/file BEFORE subcommand.
+# TXT must exist. Syntax: @space UNIQUE_LOCAL_SPACE_NAME_OR_FOLDER followed by
+# TAB_NAME PANE_NUMBER TRUSTED_BASH_COMMAND. Quote names with spaces; panes 1..32.
+# Example TXT:
+# @space /home/USER
+# "Pi work" 1 cd -- /home/USER/work && pi --session '/absolute/session.jsonl'
+
+# HERDR_BOOT_BIN — optional executable used by Pi extensions.
+# Default: ~/.local/bin/herdr-boot if present, otherwise herdr-boot from PATH.
+# Example: export HERDR_BOOT_BIN=/home/USER/.local/bin/herdr-boot
+
+# HERDR_BOOT_STATE — optional helper registry/slot/launch-ledger output directory.
+# Default: ${XDG_STATE_HOME:-~/.local/state}/herdr-boot
+# Example: export HERDR_BOOT_STATE=/home/USER/.local/state/herdr-boot
+# XDG_STATE_HOME — optional absolute state base; default ~/.local/state.
+
+# HERDR_BOOT_OWNER — optional internal set/remove run UUID; normally generated
+# by revive.ts, NOT a user preference. Default: unset (explicit unguarded edit).
+# set writes a comment owner+row fingerprint; remove with an owner is a no-op if
+# it does not match, and does not require the terminal to remain in the layout.
+# Example UUID: 11111111-1111-1111-1111-111111111111
+
+# HC_TERMINAL_ID — supplied by Herdr; required for revive.ts to register a pane.
+# No default; example t12. Do not set manually or use a remote-prefixed address.
+# HC_SESSION — optional Herdr core session; normally supplied by Herdr, default
+# selected by hc itself. revive.ts forwards it to its transient cleanup service.
+# PATH — standard command lookup path. revive.ts forwards Pi's PATH to the timer;
+# fallback if missing: /usr/local/bin:/usr/bin:/bin.
+
+# /revive — per-Pi-session manual ON/OFF preference, stored as revive-state custom
+# JSONL metadata. Optional; default ON for new/forked sessions. OFF persists across
+# resume even in another panel. No separate preference file or environment knob.
+# --session, --session-dir, --continue/--resume and --fork are Pi CLI selectors;
+# restore rows use the exact absolute JSONL path, not global --continue.
+# herdr-boot pi SLOT stores/resumes JSONL under STATE/pi/SLOT; bind-pi SLOT FILE
+# seeds an unused slot. Slot paths/configuration are separate from revive.ts.

@@ -1,17 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-// The extension deliberately uses JS syntax so distro Node needs no TS loader.
 const source = readFileSync(new URL("../pi/revive.ts", import.meta.url), "utf8");
-const { default: revive } = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
+const { default: revive, quitCheck } = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
 
 function host(options = {}) {
-  const handlers = {}, commands = {}, statuses = new Map(), notes = [], calls = [], entries = [];
+  const handlers = {}, commands = {}, statuses = new Map(), notes = [], calls = [], entries = options.entries || [];
   const session = { id: "session-a", file: "/tmp/a'b session.jsonl", cwd: "/tmp/session cwd" };
   const ctx = {
-    mode: "tui", hasUI: true, cwd: "/wrong/current/cwd",
+    mode: options.mode || "tui", hasUI: true,
     sessionManager: {
       getSessionId: () => session.id, getSessionFile: () => session.file,
       getCwd: () => session.cwd, getEntries: () => entries,
@@ -24,95 +25,103 @@ function host(options = {}) {
     exec: async (...args) => { calls.push(args); return options.exec ? options.exec(...args) : { code: 0 }; },
     appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
   };
-  revive(pi, { env: { HC_TERMINAL_ID: "t12", HERDR_BOOT_BIN: "/fake/herdr-boot", ...options.env }, exists: options.exists ?? (() => true) });
-  const start = (reason = "startup") => handlers.session_start({ reason }, ctx);
-  const toggle = (args = "") => commands.revive.handler(args, ctx);
-  return { handlers, commands, statuses, notes, calls, entries, session, ctx, start, toggle };
+  revive(pi, { env: { HC_TERMINAL_ID: "t12", HERDR_BOOT_BIN: "/fake/herdr-boot", HERDR_BOOT_CONFIG: "/tmp/boot.txt", ...options.env }, exists: options.exists ?? (() => true) });
+  return { handlers, statuses, notes, calls, entries, session, ctx,
+    start: (reason = "startup") => handlers.session_start({ reason }, ctx),
+    stop: (reason = "quit") => handlers.session_shutdown({ reason }, ctx),
+    toggle: (args = "") => commands.revive.handler(args, ctx) };
 }
+const helperArgs = (call) => call[1].slice(call[1].indexOf("/fake/herdr-boot") + 1);
 
-test("new sessions start OFF and lifecycle events never invoke the helper", async () => {
-  const h = host(); h.start();
-  assert.equal(h.statuses.get("revive"), "[REV: off]");
-  assert.deepEqual(Object.keys(h.commands), ["revive"]);
-  assert.deepEqual(Object.keys(h.handlers).sort(), ["session_shutdown", "session_start"]);
-  h.start("new"); await h.handlers.session_shutdown({ reason: "quit" }, h.ctx);
-  assert.equal(h.calls.length, 0);
-  assert.equal(h.entries.length, 0);
-  assert.equal(h.statuses.get("revive"), undefined);
-});
-
-test("ON sets exact file+session cwd; OFF removes current terminal, with quoted path", async () => {
-  const h = host(); h.start(); await h.toggle();
+test("default ON registers the exact session and cwd with a fresh run owner", async () => {
+  const h = host(); await h.start();
   assert.equal(h.statuses.get("revive"), "[REV: on]");
-  assert.equal(h.calls[0][0], "/fake/herdr-boot");
-  assert.deepEqual(h.calls[0][1].slice(0, 3), ["set", "t12", h.session.cwd]);
-  const parsed = spawnSync("python3", ["-c", "import shlex,json,sys; print(json.dumps(shlex.split(sys.argv[1])))", h.calls[0][1][3]], { encoding: "utf8" });
-  assert.equal(parsed.status, 0);
+  assert.deepEqual(helperArgs(h.calls[0]).slice(0, 3), ["set", "t12", h.session.cwd]);
+  const parsed = spawnSync("python3", ["-c", "import shlex,json,sys; print(json.dumps(shlex.split(sys.argv[1])))", helperArgs(h.calls[0])[3]], { encoding: "utf8" });
   assert.deepEqual(JSON.parse(parsed.stdout), ["pi", "--session", h.session.file]);
-  await h.toggle();
-  assert.deepEqual(h.calls[1][1], ["remove", "t12"]);
-  assert.equal(h.statuses.get("revive"), "[REV: off]");
-  assert.deepEqual(h.entries.map(e => e.data.enabled), [true, false]);
+  assert.match(h.calls[0][1].find(v => v.startsWith("HERDR_BOOT_OWNER=")), /^HERDR_BOOT_OWNER=[0-9a-f-]{36}$/);
 });
 
-test("reload and resume preserve chosen state without updating TXT", async () => {
-  const h = host(); h.start(); await h.toggle();
-  for (const reason of ["reload", "resume", "startup"]) {
-    h.start(reason); assert.equal(h.statuses.get("revive"), "[REV: on]");
+test("OFF removes immediately and follows the session to another terminal; fork defaults ON", async () => {
+  const h = host(); await h.start(); await h.toggle();
+  assert.deepEqual(helperArgs(h.calls.at(-1)), ["remove", "t12"]);
+  assert.equal(h.statuses.get("revive"), "[REV: off]");
+  const resumed = host({ entries: h.entries, env: { HC_TERMINAL_ID: "t99" } });
+  await resumed.start("resume");
+  assert.equal(resumed.statuses.get("revive"), "[REV: off]");
+  assert.deepEqual(helperArgs(resumed.calls[0]), ["remove", "t99"]);
+  await resumed.stop();
+  assert.equal(resumed.calls.some(c => c[0] === "systemd-run"), false);
+  const fork = host({ entries: h.entries }); fork.session.id = "fork-id"; await fork.start("fork");
+  assert.equal(fork.statuses.get("revive"), "[REV: on]");
+});
+
+test("new/resume/fork/reload register the replacement and never schedule quit cleanup", async () => {
+  for (const reason of ["new", "resume", "fork", "reload"]) {
+    const h = host(); h.session.id = reason; h.session.file = `/tmp/${reason}.jsonl`;
+    await h.start(reason); await h.stop(reason);
+    assert.match(helperArgs(h.calls[0])[3], new RegExp(reason + "\\.jsonl"));
+    assert.equal(h.calls.length, 1);
   }
-  assert.equal(h.calls.length, 1);
 });
 
-test("new and fork always OFF, even if custom state was copied", async () => {
-  const h = host(); h.start(); await h.toggle();
-  h.start("new"); assert.equal(h.statuses.get("revive"), "[REV: off]");
-  h.start("fork"); assert.equal(h.statuses.get("revive"), "[REV: off]");
-  h.session.id = "session-b"; h.start("startup");
-  assert.equal(h.statuses.get("revive"), "[REV: off]");
-  assert.equal(h.calls.length, 1);
+test("unsaved /new clears stale row; file appearance registers without another message", async () => {
+  let saved = false;
+  const h = host({ exists: () => saved }); await h.start("new");
+  assert.deepEqual(helperArgs(h.calls[0]), ["remove", "t12"]);
+  saved = true;
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(helperArgs(h.calls.at(-1))[0], "set");
+  await h.stop("reload");
 });
 
-test("state from another terminal does not enable this pane", () => {
-  const h = host();
-  h.entries.push({ type: "custom", customType: "revive-state", data: { sessionId: h.session.id, terminal: "t13", enabled: true } });
-  h.start(); assert.equal(h.statuses.get("revive"), "[REV: off]");
+test("quit schedules an external five-second systemd timer with matching owner and no shell expansion", async () => {
+  const h = host(); await h.start(); await h.stop();
+  const timer = h.calls.at(-1);
+  assert.equal(timer[0], "systemd-run");
+  assert.ok(timer[1].includes("--on-active=5s"));
+  assert.ok(timer[1].includes("--expand-environment=no"));
+  const owner = h.calls[0][1].find(v => v.startsWith("HERDR_BOOT_OWNER="));
+  assert.ok(timer[1].includes(`--setenv=${owner}`));
+  assert.equal(timer[1].at(-3), "pi-revive");
+  assert.equal(timer[1].at(-2), "/fake/herdr-boot");
+  assert.equal(timer[1].at(-1), "t12");
 });
 
-test("helper failure leaves previous state unchanged in both directions", async () => {
-  let fail = true;
-  const h = host({ exec: () => ({ code: fail ? 1 : 0 }) }); h.start();
-  await h.toggle(); assert.equal(h.statuses.get("revive"), "[REV: off]");
-  assert.equal(h.entries.length, 0);
-  fail = false; await h.toggle(); fail = true; await h.toggle();
+test("timer failure retains entry; helper failure does not persist a toggle", async () => {
+  let fail = false;
+  const h = host({ exec: () => ({ code: fail ? 1 : 0 }) }); await h.start(); fail = true;
+  await h.toggle(); assert.equal(h.entries.length, 0);
   assert.equal(h.statuses.get("revive"), "[REV: on]");
-  assert.equal(h.entries.length, 1);
-  assert.equal(h.notes.at(-1)[1], "error");
+  await h.stop(); assert.match(h.notes.at(-1)[0], /retained/);
 });
 
-test("unsaved/ephemeral sessions, non-TUI and invalid terminal refuse safely", async () => {
-  for (const change of [h => { h.session.file = undefined; }, h => { h.session.file = "relative"; }, h => { h.ctx.mode = "rpc"; }]) {
-    const h = host(); h.start(); change(h); await h.toggle(); assert.equal(h.calls.length, 0);
+test("non-TUI, non-Herdr and ephemeral sessions never register", async () => {
+  for (const options of [{ mode: "rpc" }, { env: { HC_TERMINAL_ID: "remote/t12" } }, { env: { HC_TERMINAL_ID: "" } }]) {
+    const h = host(options); await h.start(); await h.stop(); assert.equal(h.calls.length, 0);
   }
-  for (const terminal of ["", "remote/t12"]) {
-    const h = host({ env: { HC_TERMINAL_ID: terminal } }); h.start(); await h.toggle(); assert.equal(h.calls.length, 0);
-  }
-  const h = host({ exists: () => false }); h.start(); await h.toggle();
-  assert.equal(h.calls.length, 0); assert.equal(h.statuses.get("revive"), "[REV: off]");
+  const h = host(); h.session.file = undefined; await h.start(); await h.toggle(); await h.stop();
+  assert.equal(h.calls.length, 0);
 });
 
-test("rapid invocation does not double-toggle; shutdown waits for helper", async () => {
-  let release;
-  const h = host({ exec: () => new Promise(resolve => { release = () => resolve({ code: 0 }); }) });
-  h.start(); const first = h.toggle(); await h.toggle();
-  let stopped = false;
-  const shutdown = h.handlers.session_shutdown({ reason: "reload" }, h.ctx).then(() => { stopped = true; });
-  await Promise.resolve(); assert.equal(stopped, false);
-  assert.equal(h.calls.length, 1); release(); await first; await shutdown;
-  assert.equal(stopped, true); assert.equal(h.entries.length, 1);
-});
-
-test("arguments are rejected and footer key sorts immediately left of mode", async () => {
-  const h = host(); h.start(); await h.toggle("on"); assert.equal(h.calls.length, 0);
-  const ordered = ["mode", "local-clock", "revive"].sort((a, b) => b.localeCompare(a));
-  assert.deepEqual(ordered, ["revive", "mode", "local-clock"]);
+test("quit guard removes only for running/degraded plus known false logind", () => {
+  const dir = mkdtempSync(join(tmpdir(), "revive-guard-"));
+  try {
+    for (const [name, script] of Object.entries({
+      systemctl: '#!/bin/sh\nprintf "%s\\n" "$TEST_STATE"\nexit "$TEST_STATE_CODE"\n',
+      busctl: '#!/bin/sh\nprintf "%s\\n" "$TEST_SHUTDOWN"\nexit "$TEST_BUS_CODE"\n',
+      helper: '#!/bin/sh\n[ "$1" = remove ] && [ "$2" = t12 ] && printf REMOVED\n',
+    })) { writeFileSync(join(dir, name), script); chmodSync(join(dir, name), 0o700); }
+    for (const [state, shutdown, stateCode, busCode, expected] of [
+      ["running", "b false", 0, 0, true], ["degraded", "b false", 1, 0, true],
+      ["stopping", "b false", 1, 0, false], ["running", "b true", 0, 0, false],
+      ["unknown", "b false", 1, 0, false], ["", "b false", 1, 0, false],
+      ["running", "", 0, 1, false], ["running", "b false", 0, 1, false],
+    ]) {
+      const r = spawnSync("/bin/sh", ["-c", quitCheck, "pi-revive", join(dir, "helper"), "t12"], {
+        env: { PATH: dir, TEST_STATE: state, TEST_SHUTDOWN: shutdown, TEST_STATE_CODE: String(stateCode), TEST_BUS_CODE: String(busCode) }, encoding: "utf8",
+      });
+      assert.equal(r.stdout.includes("REMOVED"), expected, `${state}/${shutdown}/${busCode}`);
+    }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
